@@ -8,10 +8,13 @@
   import StageRail from '../components/common/StageRail.svelte'
   import { blockStore } from '../stores/blockStore'
   import { carverStore } from '../stores/carverStore'
+  import { callbackStore, callbacksByBlock } from '../stores/callbackStore'
   import { draftStore } from '../stores/draftStore'
   import { useBlockOrder } from '../hooks/useBlockOrder'
   import { useCarverLoad } from '../hooks/useCarverLoad'
   import { validateColorSequence } from '../utils/seq'
+  import { ingestCallbackMessage, type CallbackIngestResult } from '../utils/ingest'
+  import { splitCallbackMessages } from '../utils/callback'
   import { db } from '../utils/db'
   import type { Block } from '../types/block'
   import type { ProcessStage } from '../types/node'
@@ -30,11 +33,20 @@
   let selectedCarverId = $state('')
   let notice = $state('')
   let lastSync = $state('刚刚')
+  let callbackText = $state('')
+  let callbackResults = $state<CallbackIngestResult[]>([])
+  let callbackBusy = $state(false)
 
   const draft = $derived($draftStore.find((item) => item.id === draftId) ?? null)
+  const draftCallbackRecords = $derived(
+    $callbackStore.filter((record) => record.draftId === draftId),
+  )
+  const returnedBlockIds = $derived(
+    new Set(draftCallbackRecords.filter((record) => record.applied).map((record) => record.blockId)),
+  )
 
   onMount(() => {
-    void Promise.all([draftStore.load(), blockStore.load(), carverStore.load()])
+    void Promise.all([draftStore.load(), blockStore.load(), carverStore.load(), callbackStore.load()])
   })
 
   $effect(() => {
@@ -145,6 +157,69 @@
     selectedCarverId = select.value
     void refreshCarverLoad(select.value)
   }
+
+  function fillCallbackSample(): void {
+    callbackText = [
+      `画稿：${draft?.title ?? ''}`,
+      '版片：红版',
+      '印数：300',
+      '崩口：左下角有一处浅崩，已顺线修平。',
+      '来源：外协-示例-01',
+    ].join('\n')
+  }
+
+  /** 逐条处理回传：成功的消息从输入框移除，失败的原样保留以便重试 */
+  async function receiveCallbacks(): Promise<void> {
+    const messages = splitCallbackMessages(callbackText)
+    if (messages.length === 0) {
+      notice = '请先粘贴外协刻坊回传文本。'
+      return
+    }
+
+    callbackBusy = true
+    const results: CallbackIngestResult[] = []
+    const failedRaw: string[] = []
+    for (const message of messages) {
+      const result = await ingestCallbackMessage(message)
+      results.unshift(result)
+      if (result.status === 'error') failedRaw.push(message)
+    }
+
+    await Promise.all([draftStore.load(), blockStore.load(), carverStore.load(), callbackStore.load()])
+    callbackResults = [...results, ...callbackResults].slice(0, 12)
+    callbackText = failedRaw.join('\n---\n')
+    callbackBusy = false
+
+    const batchResult = results.find((result) => result.status === 'batch')
+    if (batchResult) {
+      lastSync = batchResult.message
+    } else {
+      const okCount = results.filter((result) => result.status !== 'error').length
+      lastSync = `已处理 ${okCount}/${messages.length} 条回传`
+    }
+  }
+
+  /** 写入失败后重试单条；已通过的回传在档案库中保留，不会重复计入 */
+  async function retryResult(result: CallbackIngestResult): Promise<void> {
+    const retried = await ingestCallbackMessage(result.raw)
+    await Promise.all([draftStore.load(), blockStore.load(), carverStore.load(), callbackStore.load()])
+    callbackResults = [retried, ...callbackResults.filter((item) => item !== result)].slice(0, 12)
+    lastSync = retried.message
+  }
+
+  function resultTagClass(status: CallbackIngestResult['status']): string {
+    if (status === 'error') return 'tag callback-error'
+    if (status === 'duplicate') return 'tag callback-duplicate'
+    if (status === 'batch') return 'tag callback-batch'
+    return 'tag callback-applied'
+  }
+
+  function resultTagText(status: CallbackIngestResult['status']): string {
+    if (status === 'error') return '待重试'
+    if (status === 'duplicate') return '重复仅留来源'
+    if (status === 'batch') return '已生成批次'
+    return '已更新版片'
+  }
 </script>
 
 <svelte:head>
@@ -170,7 +245,7 @@
   <section class="summary-strip four">
     <div><span>版片总数</span><strong>{$orderedBlocks.length}</strong></div>
     <div><span>刻成率</span><strong>{$blockCarvedRate}%</strong></div>
-    <div><span>在刻版片</span><strong>{$orderedBlocks.filter((block) => block.state === '在刻').length}</strong></div>
+    <div><span>外协回传</span><strong data-testid="count-callback">{returnedBlockIds.size}</strong></div>
     <div><span>需修版片</span><strong>{$orderedBlocks.filter((block) => block.defectNote).length}</strong></div>
   </section>
 
@@ -241,6 +316,16 @@
                     {#if block.state !== '已刻成' && block.state !== '已修版'}
                       <button class="mini-button strong" type="button" onclick={() => markCarved(block)}>标刻成</button>
                     {/if}
+                    {#if returnedBlockIds.has(block.id)}
+                      <small class="source-line" data-testid={`source-${block.id}`}>外协刻成</small>
+                    {:else}
+                      <small class="source-line muted">本坊自刻</small>
+                    {/if}
+                    {#each $callbacksByBlock[block.id] ?? [] as record (record.id)}
+                      <small class="source-chip" title={record.applied ? '首条回传，已据此更新' : '重复回传，仅留来源'}>
+                        {record.applied ? '首传' : '重传'} · {record.sourceKey}
+                      </small>
+                    {/each}
                   </td>
                   <td>
                     <textarea
@@ -296,4 +381,61 @@
       <a class="button secondary full" use:link href="/carvers">查看刻工档与分布</a>
     </aside>
   </div>
+
+  <section class="panel callback-panel" data-testid="panel-callback">
+    <div class="panel-heading">
+      <div>
+        <span class="section-kicker">外协刻坊</span>
+        <h2>雕完回传接收台</h2>
+      </div>
+      <span class="sync-note">已回传 {returnedBlockIds.size}/{$orderedBlocks.length} 色版 · 重复消息只留来源</span>
+    </div>
+
+    <div class="callback-grid">
+      <div class="callback-input">
+        <p class="gentle-copy">
+          粘贴外部系统分次返回的文本，每条消息按「画稿、版片（或色序）、印数、来源」填写；
+          多条消息可用一行 <code>---</code> 分隔。同一版片仅首条回传更新状态、崩口与刻版节点。
+        </p>
+        <textarea
+          data-testid="field-callback-text"
+          rows="9"
+          bind:value={callbackText}
+          placeholder="画稿：秦琼敬德&#10;版片：红版&#10;印数：300&#10;崩口：左下角浅崩一处，已顺线修平。&#10;来源：外协-2603-03"
+        ></textarea>
+        <div class="inline-actions">
+          <button class="button primary" data-testid="submit-callback" type="button" disabled={callbackBusy} onclick={receiveCallbacks}>
+            {callbackBusy ? '正在入档…' : '接收入档'}
+          </button>
+          <button class="button secondary" type="button" disabled={callbackBusy} onclick={fillCallbackSample}>填入示例</button>
+        </div>
+      </div>
+
+      <div class="callback-results">
+        <div class="section-title-row">
+          <h3>处理结果</h3>
+          <span>已通过的回传保留，失败可重试</span>
+        </div>
+        {#if callbackResults.length === 0}
+          <EmptyBox title="尚无回传" message="接收文本后，这里会逐条显示更新、重复与批次生成结果。" />
+        {:else}
+          <ul class="callback-result-list">
+            {#each callbackResults as result, resultIndex (resultIndex)}
+              <li data-testid="row-callback-result" class="result-{result.status}">
+                <div class="result-head">
+                  <span class={resultTagClass(result.status)}>{resultTagText(result.status)}</span>
+                  {#if result.status === 'error'}
+                    <button class="mini-button strong" data-testid="retry-callback" type="button" onclick={() => retryResult(result)}>
+                      重试
+                    </button>
+                  {/if}
+                </div>
+                <p>{result.message}</p>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    </div>
+  </section>
 {/if}

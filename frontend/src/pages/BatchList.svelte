@@ -94,13 +94,14 @@
   }
 
   async function exportArchive(): Promise<void> {
-    const [drafts, blocks, carvers, nodes] = await Promise.all([
+    const [drafts, blocks, carvers, nodes, callbacks] = await Promise.all([
       db.drafts.toArray(),
       db.blocks.toArray(),
       db.carvers.toArray(),
       db.nodes.toArray(),
+      db.callbacks.toArray(),
     ])
-    downloadJson('木版年画工序档案.json', { exportedAt: new Date().toISOString(), drafts, blocks, batches, carvers, nodes })
+    downloadJson('木版年画工序档案.json', { exportedAt: new Date().toISOString(), drafts, blocks, batches, carvers, nodes, callbacks })
   }
 </script>
 
@@ -222,7 +223,10 @@
       <article class="panel batch-item" data-testid="row-batch">
         <div class="batch-number">
           <span>{batch.printedAt.replace(/-/g, '.')}</span>
-          <h2>{batch.batchNo}</h2>
+          <h2>
+            {batch.batchNo}
+            {#if batch.source === '外协回传'}<span class="tag callback-batch" data-testid="tag-outsource-batch">外协汇总</span>{/if}
+          </h2>
           <p>{draftTitle(batch.draftId)} · {batch.paperBatch}</p>
         </div>
         <div class="batch-counts">

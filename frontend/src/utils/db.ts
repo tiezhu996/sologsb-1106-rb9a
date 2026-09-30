@@ -4,6 +4,7 @@ import type { Block } from '../types/block'
 import type { Carver } from '../types/carver'
 import type { PrintBatch } from '../types/batch'
 import type { ProcessNode } from '../types/node'
+import type { CarvingCallback } from '../types/callback'
 
 type StoredRecord = Record<string, unknown> & { schemaRev?: number }
 
@@ -13,6 +14,7 @@ class WoodprintDatabase extends Dexie {
   carvers!: Table<Carver, string>
   batches!: Table<PrintBatch, string>
   nodes!: Table<ProcessNode, string>
+  callbacks!: Table<CarvingCallback, string>
 
   constructor() {
     super('gbwoodprint-db')
@@ -38,6 +40,20 @@ class WoodprintDatabase extends Dexie {
         for (const tableName of tableNames) {
           await transaction.table(tableName).toCollection().modify((record: StoredRecord) => {
             record.schemaRev = 2
+          })
+        }
+      })
+
+    // version(3) 新增外协刻坊回传表：旧版片没有回传记录，仍按本坊自刻处理
+    this.version(3)
+      .stores({
+        callbacks: 'id, draftId, blockId, sourceKey, applied, receivedAt, schemaRev',
+      })
+      .upgrade(async (transaction) => {
+        const tableNames = ['drafts', 'blocks', 'carvers', 'batches', 'nodes'] as const
+        for (const tableName of tableNames) {
+          await transaction.table(tableName).toCollection().modify((record: StoredRecord) => {
+            record.schemaRev = 3
           })
         }
       })
@@ -194,7 +210,7 @@ const nodes: ProcessNode[] = [
 ]
 
 function withSchemaRevision<T extends object>(records: T[]): Array<T & { schemaRev: number }> {
-  return records.map((record) => ({ ...record, schemaRev: 2 }))
+  return records.map((record) => ({ ...record, schemaRev: 3 }))
 }
 
 export const db = new WoodprintDatabase()
@@ -214,7 +230,7 @@ export async function initializeDatabase(): Promise<void> {
   const draftCount = await db.drafts.count()
   if (draftCount > 0) return
 
-  await db.transaction('rw', db.drafts, db.blocks, db.carvers, db.batches, db.nodes, async () => {
+  await db.transaction('rw', [db.drafts, db.blocks, db.carvers, db.batches, db.nodes, db.callbacks], async () => {
     await db.drafts.bulkPut(withSchemaRevision(drafts))
     await db.blocks.bulkPut(withSchemaRevision(blocks))
     await db.carvers.bulkPut(withSchemaRevision(carvers))
