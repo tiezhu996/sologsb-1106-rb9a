@@ -9,12 +9,15 @@
   import { blockStore } from '../stores/blockStore'
   import { carverStore } from '../stores/carverStore'
   import { draftStore } from '../stores/draftStore'
+  import { returnStore } from '../stores/returnStore'
   import { useBlockOrder } from '../hooks/useBlockOrder'
   import { useCarverLoad } from '../hooks/useCarverLoad'
   import { validateColorSequence } from '../utils/seq'
+  import { SAMPLE_RETURN_TEXT } from '../utils/carvingReturn'
   import { db } from '../utils/db'
   import type { Block } from '../types/block'
   import type { ProcessStage } from '../types/node'
+  import type { IngestReturnResult } from '../types/carvingReturn'
 
   const draftId = $derived($params?.id ?? '')
   const {
@@ -30,11 +33,18 @@
   let selectedCarverId = $state('')
   let notice = $state('')
   let lastSync = $state('刚刚')
+  let returnText = $state('')
+  let returnBusy = $state(false)
+  let returnResult = $state<IngestReturnResult | null>(null)
 
   const draft = $derived($draftStore.find((item) => item.id === draftId) ?? null)
+  const draftReturns = $derived($returnStore.filter((item) => item.draftId === draftId))
+  const returnedBlockIds = $derived(
+    new Set(draftReturns.filter((item) => item.applied).map((item) => item.blockId)),
+  )
 
   onMount(() => {
-    void Promise.all([draftStore.load(), blockStore.load(), carverStore.load()])
+    void Promise.all([draftStore.load(), blockStore.load(), carverStore.load(), returnStore.load()])
   })
 
   $effect(() => {
@@ -145,6 +155,51 @@
     selectedCarverId = select.value
     void refreshCarverLoad(select.value)
   }
+
+  async function ingestReturn(): Promise<void> {
+    if (returnBusy) return
+    if (!returnText.trim()) {
+      returnResult = {
+        ok: false,
+        message: '请先粘贴外协刻坊的回传文本。',
+        issues: [],
+        createdReturnId: null,
+        applied: false,
+        batchNo: null,
+      }
+      return
+    }
+
+    returnBusy = true
+    try {
+      const result = await returnStore.ingest(returnText)
+      returnResult = result
+      if (result.ok) {
+        await Promise.all([draftStore.load(), blockStore.load(), carverStore.load()])
+        lastSync = result.applied ? '外协回传已落库' : '重复回传仅留来源'
+        if (result.applied) {
+          returnText = ''
+          defectDraft = {}
+        }
+      }
+    } finally {
+      returnBusy = false
+    }
+  }
+
+  function fillSampleReturn(): void {
+    returnText = SAMPLE_RETURN_TEXT
+  }
+
+  function blockReturns(blockId: string) {
+    return draftReturns
+      .filter((item) => item.blockId === blockId)
+      .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt))
+  }
+
+  function formatReceivedAt(value: string): string {
+    return value.replace('T', ' ').slice(0, 16)
+  }
 </script>
 
 <svelte:head>
@@ -171,7 +226,66 @@
     <div><span>版片总数</span><strong>{$orderedBlocks.length}</strong></div>
     <div><span>刻成率</span><strong>{$blockCarvedRate}%</strong></div>
     <div><span>在刻版片</span><strong>{$orderedBlocks.filter((block) => block.state === '在刻').length}</strong></div>
-    <div><span>需修版片</span><strong>{$orderedBlocks.filter((block) => block.defectNote).length}</strong></div>
+    <div><span>已收回执</span><strong data-testid="count-return">{returnedBlockIds.size}/{$orderedBlocks.length}</strong></div>
+  </section>
+
+  <section class="panel return-panel" data-testid="panel-return">
+    <div class="panel-heading">
+      <div>
+        <span class="section-kicker">外协刻坊</span>
+        <h2>雕完结果回传接收台</h2>
+      </div>
+      <span class="sync-note">同一版片仅首条回执更新进度，重复消息只留来源</span>
+    </div>
+    <div class="return-entry">
+      <textarea
+        data-testid="field-return-text"
+        rows="7"
+        bind:value={returnText}
+        placeholder="粘贴回传文本，例如：&#10;画稿：秦琼敬德&#10;版片：红版&#10;状态：已刻成&#10;崩口：冠缨根部浅崩一处，已嵌补&#10;印数：360&#10;工序节点：刻版、修版&#10;来源：西关刻坊-回执0312"
+      ></textarea>
+      <div class="return-actions">
+        <button class="button primary" data-testid="submit-return" type="button" disabled={returnBusy} onclick={ingestReturn}>
+          {returnBusy ? '接收中…' : '接收入档'}
+        </button>
+        <button class="button ghost" type="button" disabled={returnBusy} onclick={fillSampleReturn}>填入示例</button>
+        <p class="return-hint">写入失败不会丢失已通过的回执，按「接收入档」即可重试。</p>
+      </div>
+    </div>
+    {#if returnResult}
+      <p
+        class="notice"
+        data-testid="return-message"
+        class:ok={returnResult.ok}
+        class:duplicate={returnResult.ok && !returnResult.applied}
+      >
+        {returnResult.message}
+        {#if !returnResult.ok}
+          <button class="text-button" type="button" disabled={returnBusy} onclick={ingestReturn}>重试</button>
+        {/if}
+      </p>
+    {/if}
+
+    {#if draftReturns.length > 0}
+      <div class="return-log">
+        <div class="section-title-row">
+          <span class="section-kicker">本稿回执</span>
+          <strong>{draftReturns.length} 条</strong>
+        </div>
+        <ul>
+          {#each [...draftReturns].sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)) as item (item.id)}
+            {@const block = $orderedBlocks.find((candidate) => candidate.id === item.blockId)}
+            <li data-testid="row-return" class={item.applied ? 'is-applied' : 'is-duplicate'}>
+              <span class="tag {item.applied ? 'tag-applied' : 'tag-duplicate'}">{item.applied ? '已落库' : '重复留源'}</span>
+              <strong>{block?.blockName ?? '未知版片'}</strong>
+              <span>{item.source}</span>
+              <small>{formatReceivedAt(item.receivedAt)}</small>
+              {#if item.applied && item.printQty !== undefined}<em>可印 {item.printQty}</em>{/if}
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
   </section>
 
   <div class="workbench-grid">
@@ -197,6 +311,7 @@
                 <th>刻工指派</th>
                 <th>状态</th>
                 <th>崩口与修补</th>
+                <th>来源 / 回执</th>
               </tr>
             </thead>
             <tbody>
@@ -251,9 +366,24 @@
                     ></textarea>
                     <button class="mini-button" type="button" onclick={() => saveDefect(block)}>存记录</button>
                   </td>
+                  <td class="source-cell">
+                    <span class="tag source-tag {block.sourceMode === 'outsource' ? 'source-outsource' : 'source-self'}">
+                      {block.sourceMode === 'outsource' ? '外协回传' : '本坊自刻'}
+                    </span>
+                    {#if blockReturns(block.id).length > 0}
+                      <ul class="block-return-list">
+                        {#each blockReturns(block.id) as item (item.id)}
+                          <li class={item.applied ? 'is-applied' : 'is-duplicate'}>
+                            {item.applied ? '首条' : '重复'} · {item.source}
+                            <small>{formatReceivedAt(item.receivedAt)}</small>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                  </td>
                 </tr>
                 <tr class="stage-row">
-                  <td colspan="6">
+                  <td colspan="7">
                     <StageRail
                       activeIndex={blockStateStage(block.state)}
                       completedCount={block.state === '已刻成' || block.state === '已修版' ? 5 : block.state === '在刻' ? 3 : 1}
